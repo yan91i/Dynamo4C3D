@@ -1,0 +1,28 @@
+-`assets/images/Tips/Select multiple rows.gif`: Shows a bug, fix and recreate it.
+-Grading Pro: Improve basic workflow
+- 'Showing PDK Data': Shows a bug
+
+-ET: Integrated parent-child region creation and management workflow: Show with different suggrade depth
+-ET: Demonstrate the complete workflow: Showing full and children at once so takes less time. Just one full execution.
+
+-GP: Missing to show how create a new surface.
+-GP: Improve Section Reference paths gif.
+-GP: Improve Apply or Overview gif.
+-GP: Improve showing more value of profiles cases.
+-GP: Improve quality of Creating Individual Section Placements
+-GP: Improve Object Feature Line Integration gif
+
+-SH: Missing Label Styles Children Component Editing
+-SH: Missing Main Component–Subcomponent Relationships
+-SH, TI: Missing How Component Column Works
+
+-TI: Improve 'Show complete inspection process' and '' by showing the components and finding the related objects.
+-TI: Missing Usage Status
+-TI: Recreate Basic-Workflow as it is confusing now.
+
+-TOL: Complete workflow, don't resize window.
+-TOL: Import from closed file is importing the same open file
+
+-TOL: To Export of open active file data, don't load anything as it is not required
+
+-TSS: missing videos in TSS-Transfer-Point-Description-Keys
