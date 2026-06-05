@@ -1,0 +1,77 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Camber</RootNamespace>
+    <TargetFramework>net8.0-windows</TargetFramework>
+	<UseWPF>true</UseWPF>
+    <AssemblyTitle>CamberUI</AssemblyTitle>
+    <Product>Camber</Product>
+    <Description>UI nodes for the Camber Dynamo package.</Description>
+    <Copyright>Copyright © 2024</Copyright>
+    <AssemblyVersion>5.0.0.0</AssemblyVersion>
+    <FileVersion>5.0.0.0</FileVersion>
+    <BuildDependsOn>$(BuildDependsOn);AfterBuildMigrated</BuildDependsOn>
+    <BaseOutputPath>bin\</BaseOutputPath>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+	<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+	<DebugType>pdbonly</DebugType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|AnyCPU'">
+	<DebugSymbols>true</DebugSymbols>
+	<DefineConstants>DEBUG;TRACE</DefineConstants>
+	<DebugType>full</DebugType>
+	<LangVersion>7.3</LangVersion>
+  </PropertyGroup>
+  <Import Project="..\Camber\packages\NUnit.3.13.2\build\NUnit.props" Condition="Exists('..\Camber\packages\NUnit.3.13.2\build\NUnit.props')" />
+  <ItemGroup>
+    <Reference Include="accoremgd">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\accoremgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Acdbmgd">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\acdbmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AcDynamoServices">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\C3D\Dynamo\AcDynamoServices.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AecBaseMgd">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\ACA\AecBaseMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AeccDbMgd">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\C3D\AeccDbMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AeccPressurePipesMgd">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\C3D\AeccPressurePipesMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AutoCADNodes">
+      <HintPath>..\..\lib\Autodesk\AutoCAD 2025\C3D\Dynamo\AutoCADNodes.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Camber\Camber.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="DynamoVisualProgramming.WpfUILibrary" Version="3.2.2.5494" />
+    <PackageReference Include="Microsoft.Windows.Compatibility" Version="8.0.8" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Update="Properties\Resources.Designer.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Resources.resx</DependentUpon>
+    </Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+  </ItemGroup>
+</Project>
