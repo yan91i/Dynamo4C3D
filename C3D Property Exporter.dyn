@@ -1,0 +1,356 @@
+{
+  "Uuid": "16cdae65-56f0-4e96-9cef-0f5c41df1e4a",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "C3D Property Exporter",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "Id": "ad58cab4dbd1464fa2e5705077a98ce5",
+      "NodeType": "BooleanInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "f2a9d0e6d83a4546aa260d2bf371e6d4",
+          "Name": "",
+          "Description": "Boolean",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Enables selection between True and False",
+      "InputValue": true
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n# Dynamo for Civil 3D / CPython3\r\n#\r\n# 输入：\r\n# IN[0] = 完整XLSX输出路径\r\n# IN[1] = 是否执行\r\n# IN[2] = 是否包含全部布局\r\n# IN[3] = 是否额外扫描本地块定义\r\n#\r\n# 输出：\r\n# OUT = 状态、文件路径、对象数量、日志预览\r\n#\r\n# 依赖：\r\n# Civil 3D随软件安装的.NET程序集\r\n# Python标准库\r\n# 不需要Excel、openpyxl或第三方Dynamo包\r\n#\r\n# 只读DWG，不创建或修改对象及Property Sets。\r\n# 已存在的目标XLSX会被覆盖。\r\n\r\nimport os\r\nimport re\r\nimport math\r\nimport numbers\r\nimport tempfile\r\nimport zipfile\r\nimport traceback\r\nimport xml.etree.ElementTree as ET\r\n\r\nfrom datetime import datetime\r\nfrom types import SimpleNamespace\r\n\r\n\r\nLOG = []\r\nSTAGE = \"初始化\"\r\n\r\n\r\n# ============================================================\r\n# 日志和属性读取\r\n# ============================================================\r\n\r\ndef log(handle, stage, message):\r\n    LOG.append([\r\n        str(handle) if handle is not None else \"\",\r\n        str(stage),\r\n        str(message)\r\n    ])\r\n\r\n\r\ndef read(obj, name, handle=\"\"):\r\n    \"\"\"属性不存在时返回None；存在但读取失败时记录日志。\"\"\"\r\n    try:\r\n        prop = obj.GetType().GetProperty(name)\r\n\r\n        if prop is None:\r\n            return None\r\n\r\n        return getattr(obj, name)\r\n\r\n    except Exception as ex:\r\n        log(handle, \"读取属性：\" + name, ex)\r\n        return None\r\n\r\n\r\ndef first(obj, names, handle=\"\"):\r\n    \"\"\"按顺序读取第一个非空属性。\"\"\"\r\n    for name in names:\r\n        value = read(obj, name, handle)\r\n\r\n        if value is not None and str(value) != \"\":\r\n            return value\r\n\r\n    return None\r\n\r\n\r\ndef plain(value):\r\n    \"\"\"将.NET/Python值转换为Excel可写入的基础类型。\"\"\"\r\n    if value is None:\r\n        return None\r\n\r\n    if isinstance(value, bool):\r\n        return value\r\n\r\n    if isinstance(value, numbers.Integral):\r\n        return int(value)\r\n\r\n    if isinstance(value, numbers.Real):\r\n        number = float(value)\r\n        return number if math.isfinite(number) else str(number)\r\n\r\n    try:\r\n        type_name = value.GetType().FullName\r\n\r\n        if type_name == \"System.Boolean\":\r\n            return bool(value)\r\n\r\n        integer_types = (\r\n            \"System.Byte\",\r\n            \"System.SByte\",\r\n            \"System.Int16\",\r\n            \"System.Int32\",\r\n            \"System.Int64\",\r\n            \"System.UInt16\",\r\n            \"System.UInt32\",\r\n            \"System.UInt64\"\r\n        )\r\n\r\n        real_types = (\r\n            \"System.Double\",\r\n            \"System.Single\",\r\n            \"System.Decimal\"\r\n        )\r\n\r\n        if type_name in integer_types:\r\n            return int(value)\r\n\r\n        if type_name in real_types:\r\n            number = float(value)\r\n            return number if math.isfinite(number) else str(number)\r\n\r\n    except Exception:\r\n        pass\r\n\r\n    return str(value)\r\n\r\n\r\ndef object_name(tr, oid, handle=\"\"):\r\n    \"\"\"通过ObjectId读取样式、材料或块定义名称。\"\"\"\r\n    if oid is None:\r\n        return None\r\n\r\n    try:\r\n        if oid.IsNull:\r\n            return None\r\n\r\n        obj = tr.GetObject(oid, OpenMode.ForRead)\r\n        return read(obj, \"Name\", handle)\r\n\r\n    except Exception as ex:\r\n        log(handle, \"解析ObjectId名称\", ex)\r\n        return None\r\n\r\n\r\n# ============================================================\r\n# 特征线枚举修复\r\n# ============================================================\r\n\r\ndef resolve_feature_line_points(clr_module, feature_line_class):\r\n    \"\"\"\r\n    从GetPoints方法的枚举参数类型读取AllPoints字段。\r\n    不导入FeatureLinePointType。\r\n    不调用Enum.GetNames或Enum.Parse。\r\n    \"\"\"\r\n    feature_line_type = clr_module.GetClrType(feature_line_class)\r\n\r\n    for method in feature_line_type.GetMethods():\r\n        if method.Name != \"GetPoints\":\r\n            continue\r\n\r\n        parameters = method.GetParameters()\r\n\r\n        if len(parameters) != 1:\r\n            continue\r\n\r\n        enum_type = parameters[0].ParameterType\r\n\r\n        if not enum_type.IsEnum:\r\n            continue\r\n\r\n        field = enum_type.GetField(\"AllPoints\")\r\n\r\n        if field is None:\r\n            continue\r\n\r\n        value = field.GetValue(None)\r\n\r\n        if value is not None:\r\n            return SimpleNamespace(AllPoints=value)\r\n\r\n    raise RuntimeError(\r\n        \"当前Civil 3D API中未找到\"\r\n        \"FeatureLine.GetPoints所需的AllPoints枚举字段。\"\r\n    )\r\n\r\n\r\n# ============================================================\r\n# 顶点读取\r\n# ============================================================\r\n\r\ndef vertex_points(obj, tr):\r\n    \"\"\"\r\n    支持：\r\n    Polyline、Polyline2d、Polyline3d、\r\n    FeatureLine、Line、CogoPoint、DBPoint。\r\n\r\n    普通空间中的坐标按WCS读取。\r\n    块定义中的坐标为定义坐标，不进行实例变换。\r\n    \"\"\"\r\n    if isinstance(obj, Polyline):\r\n        points = [\r\n            obj.GetPoint3dAt(i)\r\n            for i in range(obj.NumberOfVertices)\r\n        ]\r\n        return points, \"Polyline vertices\"\r\n\r\n    if isinstance(obj, Polyline3d):\r\n        points = []\r\n\r\n        for vertex_id in obj:\r\n            vertex = tr.GetObject(vertex_id, OpenMode.ForRead)\r\n            points.append(vertex.Position)\r\n\r\n        return points, \"Polyline3d vertices\"\r\n\r\n    if isinstance(obj, Polyline2d):\r\n        points = []\r\n        matrix = Matrix3d.PlaneToWorld(obj.Normal)\r\n\r\n        for vertex_id in obj:\r\n            vertex = tr.GetObject(vertex_id, OpenMode.ForRead)\r\n            position = vertex.Position\r\n\r\n            point = Point3d(\r\n                position.X,\r\n                position.Y,\r\n                obj.Elevation\r\n            ).TransformBy(matrix)\r\n\r\n            points.append(point)\r\n\r\n        return points, \"Polyline2d vertices\"\r\n\r\n    if isinstance(obj, FeatureLine):\r\n        if FeatureLinePointType is None:\r\n            raise RuntimeError(\r\n                \"特征线AllPoints枚举初始化失败，\"\r\n                \"请检查Log中的FeatureLine enum记录。\"\r\n            )\r\n\r\n        points = list(\r\n            obj.GetPoints(FeatureLinePointType.AllPoints)\r\n        )\r\n\r\n        return points, \"FeatureLine points\"\r\n\r\n    if isinstance(obj, Line):\r\n        return [\r\n            obj.StartPoint,\r\n            obj.EndPoint\r\n        ], \"Line endpoints\"\r\n\r\n    if isinstance(obj, CogoPoint):\r\n        return [\r\n            Point3d(\r\n                obj.Easting,\r\n                obj.Northing,\r\n                obj.Elevation\r\n            )\r\n        ], \"COGO location\"\r\n\r\n    if isinstance(obj, DBPoint):\r\n        return [obj.Position], \"Point location\"\r\n\r\n    return [], \"Not applicable / not implemented\"\r\n\r\n\r\n# ============================================================\r\n# XLSX生成：仅使用Python标准库\r\n# ============================================================\r\n\r\nMAIN_NS = (\r\n    \"http://schemas.openxmlformats.org/\"\r\n    \"spreadsheetml/2006/main\"\r\n)\r\n\r\nREL_NS = (\r\n    \"http://schemas.openxmlformats.org/\"\r\n    \"officeDocument/2006/relationships\"\r\n)\r\n\r\nPACKAGE_NS = (\r\n    \"http://schemas.openxmlformats.org/\"\r\n    \"package/2006/relationships\"\r\n)\r\n\r\nCONTENT_NS = (\r\n    \"http://schemas.openxmlformats.org/\"\r\n    \"package/2006/content-types\"\r\n)\r\n\r\nET.register_namespace(\"\", MAIN_NS)\r\nET.register_namespace(\"r\", REL_NS)\r\n\r\n\r\ndef tag(namespace, name):\r\n    return \"{\" + namespace + \"}\" + name\r\n\r\n\r\ndef column_name(index):\r\n    result = \"\"\r\n\r\n    while index:\r\n        index, remainder = divmod(index - 1, 26)\r\n        result = chr(65 + remainder) + result\r\n\r\n    return result\r\n\r\n\r\ndef xml_bytes(root):\r\n    return ET.tostring(\r\n        root,\r\n        encoding=\"utf-8\",\r\n        xml_declaration=True\r\n    )\r\n\r\n\r\ndef clean_xml_text(value):\r\n    \"\"\"删除XML不允许的控制字符和孤立代理字符。\"\"\"\r\n    return re.sub(\r\n        r\"[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\"\r\n        r\"\\uD800-\\uDFFF\\uFFFE\\uFFFF]\",\r\n        \"\",\r\n        str(value)\r\n    )\r\n\r\n\r\ndef sheet_xml(rows):\r\n    root = ET.Element(tag(MAIN_NS, \"worksheet\"))\r\n    data = ET.SubElement(root, tag(MAIN_NS, \"sheetData\"))\r\n\r\n    for row_index, values in enumerate(rows, 1):\r\n        row = ET.SubElement(\r\n            data,\r\n            tag(MAIN_NS, \"row\"),\r\n            {\"r\": str(row_index)}\r\n        )\r\n\r\n        for column_index, raw_value in enumerate(values, 1):\r\n            value = plain(raw_value)\r\n\r\n            if value is None:\r\n                continue\r\n\r\n            address = column_name(column_index) + str(row_index)\r\n\r\n            cell = ET.SubElement(\r\n                row,\r\n                tag(MAIN_NS, \"c\"),\r\n                {\"r\": address}\r\n            )\r\n\r\n            if isinstance(value, bool):\r\n                cell.set(\"t\", \"b\")\r\n\r\n                ET.SubElement(\r\n                    cell,\r\n                    tag(MAIN_NS, \"v\")\r\n                ).text = \"1\" if value else \"0\"\r\n\r\n            elif isinstance(value, (int, float)):\r\n                # 长整数按文本写入，避免Excel数字精度损失。\r\n                if isinstance(value, int) and len(str(abs(value))) > 15:\r\n                    cell.set(\"t\", \"inlineStr\")\r\n                    inline = ET.SubElement(cell, tag(MAIN_NS, \"is\"))\r\n                    ET.SubElement(\r\n                        inline,\r\n                        tag(MAIN_NS, \"t\")\r\n                    ).text = str(value)\r\n                else:\r\n                    ET.SubElement(\r\n                        cell,\r\n                        tag(MAIN_NS, \"v\")\r\n                    ).text = str(value)\r\n\r\n            else:\r\n                text = clean_xml_text(value)\r\n\r\n                if len(text) > 32767:\r\n                    raise ValueError(\r\n                        \"单元格文本超过32767字符：\" + address\r\n                    )\r\n\r\n                # 作为文本写入，避免属性值被识别为Excel公式。\r\n                cell.set(\"t\", \"inlineStr\")\r\n                inline = ET.SubElement(cell, tag(MAIN_NS, \"is\"))\r\n                text_node = ET.SubElement(\r\n                    inline,\r\n                    tag(MAIN_NS, \"t\")\r\n                )\r\n\r\n                text_node.set(\r\n                    \"{http://www.w3.org/XML/1998/namespace}space\",\r\n                    \"preserve\"\r\n                )\r\n                text_node.text = text\r\n\r\n    return xml_bytes(root)\r\n\r\n\r\ndef write_xlsx(path, sheets):\r\n    \"\"\"先写临时文件，成功后替换目标文件。\"\"\"\r\n    for sheet_name, rows in sheets:\r\n        if len(rows) > 1048576:\r\n            raise ValueError(\r\n                sheet_name + \" 超过Excel工作表行数上限\"\r\n            )\r\n\r\n        if any(len(row) > 16384 for row in rows):\r\n            raise ValueError(\r\n                sheet_name + \" 超过Excel工作表列数上限\"\r\n            )\r\n\r\n    folder = os.path.dirname(path)\r\n    os.makedirs(folder, exist_ok=True)\r\n\r\n    file_descriptor, temporary_path = tempfile.mkstemp(\r\n        suffix=\".xlsx\",\r\n        dir=folder\r\n    )\r\n    os.close(file_descriptor)\r\n\r\n    try:\r\n        workbook = ET.Element(tag(MAIN_NS, \"workbook\"))\r\n        sheet_nodes = ET.SubElement(\r\n            workbook,\r\n            tag(MAIN_NS, \"sheets\")\r\n        )\r\n\r\n        workbook_relationships = ET.Element(\r\n            tag(PACKAGE_NS, \"Relationships\")\r\n        )\r\n\r\n        content_types = ET.Element(\r\n            tag(CONTENT_NS, \"Types\")\r\n        )\r\n\r\n        ET.SubElement(\r\n            content_types,\r\n            tag(CONTENT_NS, \"Default\"),\r\n            {\r\n                \"Extension\": \"rels\",\r\n                \"ContentType\":\r\n                    \"application/vnd.openxmlformats-package.\"\r\n                    \"relationships+xml\"\r\n            }\r\n        )\r\n\r\n        ET.SubElement(\r\n            content_types,\r\n            tag(CONTENT_NS, \"Default\"),\r\n            {\r\n                \"Extension\": \"xml\",\r\n                \"ContentType\": \"application/xml\"\r\n            }\r\n        )\r\n\r\n        ET.SubElement(\r\n            content_types,\r\n            tag(CONTENT_NS, \"Override\"),\r\n            {\r\n                \"PartName\": \"/xl/workbook.xml\",\r\n                \"ContentType\":\r\n                    \"application/vnd.openxmlformats-officedocument.\"\r\n                    \"spreadsheetml.sheet.main+xml\"\r\n            }\r\n        )\r\n\r\n        root_relationships = ET.Element(\r\n            tag(PACKAGE_NS, \"Relationships\")\r\n        )\r\n\r\n        ET.SubElement(\r\n            root_relationships,\r\n            tag(PACKAGE_NS, \"Relationship\"),\r\n            {\r\n                \"Id\": \"rId1\",\r\n                \"Type\": REL_NS + \"/officeDocument\",\r\n                \"Target\": \"xl/workbook.xml\"\r\n            }\r\n        )\r\n\r\n        with zipfile.ZipFile(\r\n            temporary_path,\r\n            \"w\",\r\n            zipfile.ZIP_DEFLATED\r\n        ) as archive:\r\n\r\n            for index, (sheet_name, rows) in enumerate(sheets, 1):\r\n                relationship_id = \"rId\" + str(index)\r\n                sheet_file = \"sheet{}.xml\".format(index)\r\n\r\n                ET.SubElement(\r\n                    sheet_nodes,\r\n                    tag(MAIN_NS, \"sheet\"),\r\n                    {\r\n                        \"name\": sheet_name,\r\n                        \"sheetId\": str(index),\r\n                        tag(REL_NS, \"id\"): relationship_id\r\n                    }\r\n                )\r\n\r\n                ET.SubElement(\r\n                    workbook_relationships,\r\n                    tag(PACKAGE_NS, \"Relationship\"),\r\n                    {\r\n                        \"Id\": relationship_id,\r\n                        \"Type\": REL_NS + \"/worksheet\",\r\n                        \"Target\": \"worksheets/\" + sheet_file\r\n                    }\r\n                )\r\n\r\n                ET.SubElement(\r\n                    content_types,\r\n                    tag(CONTENT_NS, \"Override\"),\r\n                    {\r\n                        \"PartName\": \"/xl/worksheets/\" + sheet_file,\r\n                        \"ContentType\":\r\n                            \"application/vnd.openxmlformats-officedocument.\"\r\n                            \"spreadsheetml.worksheet+xml\"\r\n                    }\r\n                )\r\n\r\n                archive.writestr(\r\n                    \"xl/worksheets/\" + sheet_file,\r\n                    sheet_xml(rows)\r\n                )\r\n\r\n            archive.writestr(\r\n                \"[Content_Types].xml\",\r\n                xml_bytes(content_types)\r\n            )\r\n\r\n            archive.writestr(\r\n                \"_rels/.rels\",\r\n                xml_bytes(root_relationships)\r\n            )\r\n\r\n            archive.writestr(\r\n                \"xl/workbook.xml\",\r\n                xml_bytes(workbook)\r\n            )\r\n\r\n            archive.writestr(\r\n                \"xl/_rels/workbook.xml.rels\",\r\n                xml_bytes(workbook_relationships)\r\n            )\r\n\r\n        os.replace(temporary_path, path)\r\n\r\n    finally:\r\n        if os.path.exists(temporary_path):\r\n            os.remove(temporary_path)\r\n\r\n\r\n# ============================================================\r\n# 主程序\r\n# ============================================================\r\n\r\ndef export():\r\n    global STAGE\r\n    global OpenMode, Entity, Curve, BlockReference\r\n    global Polyline, Polyline2d, Polyline3d, Line, DBPoint\r\n    global CogoPoint, FeatureLine, FeatureLinePointType\r\n    global Point3d, Matrix3d\r\n\r\n    STAGE = \"检查输入\"\r\n\r\n    if len(IN) < 4:\r\n        raise ValueError(\"Python节点必须设置4个输入端口\")\r\n\r\n    if not bool(IN[1]):\r\n        return {\"Status\": \"未执行\"}\r\n\r\n    if not isinstance(IN[0], str) or not IN[0].strip():\r\n        raise ValueError(\"IN[0]必须是非空的XLSX路径字符串\")\r\n\r\n    raw_path = IN[0].strip()\r\n\r\n    if not os.path.isabs(raw_path):\r\n        raise ValueError(\r\n            \"IN[0]必须是完整绝对路径，例如：\"\r\n            r\"D:\\BIM_Export\\DWG_Properties.xlsx\"\r\n        )\r\n\r\n    path = os.path.abspath(raw_path)\r\n\r\n    if not path.lower().endswith(\".xlsx\"):\r\n        raise ValueError(\"输出文件扩展名必须为.xlsx\")\r\n\r\n    include_layouts = bool(IN[2])\r\n    include_blocks = bool(IN[3])\r\n\r\n    STAGE = \"加载.NET程序集\"\r\n\r\n    import clr\r\n\r\n    for assembly in (\r\n        \"AcMgd\",\r\n        \"AcCoreMgd\",\r\n        \"AcDbMgd\",\r\n        \"AecBaseMgd\",\r\n        \"AecPropDataMgd\",\r\n        \"AeccDbMgd\"\r\n    ):\r\n        clr.AddReference(assembly)\r\n\r\n    from Autodesk.AutoCAD.ApplicationServices import Application\r\n\r\n    from Autodesk.AutoCAD.DatabaseServices import (\r\n        OpenMode,\r\n        Entity,\r\n        Curve,\r\n        BlockReference,\r\n        Polyline,\r\n        Polyline2d,\r\n        Polyline3d,\r\n        Line,\r\n        DBPoint\r\n    )\r\n\r\n    from Autodesk.AutoCAD.Geometry import (\r\n        Point3d,\r\n        Matrix3d\r\n    )\r\n\r\n    # 不从DatabaseServices导入FeatureLinePointType。\r\n    from Autodesk.Civil.DatabaseServices import (\r\n        CogoPoint,\r\n        FeatureLine\r\n    )\r\n\r\n    from Autodesk.Aec.PropertyData.DatabaseServices import (\r\n        PropertyDataServices\r\n    )\r\n\r\n    STAGE = \"初始化特征线枚举\"\r\n\r\n    FeatureLinePointType = None\r\n\r\n    try:\r\n        FeatureLinePointType = resolve_feature_line_points(\r\n            clr,\r\n            FeatureLine\r\n        )\r\n    except Exception as ex:\r\n        # 特征线顶点功能失败时，仍继续导出其他对象和属性。\r\n        log(\"\", \"FeatureLine enum\", ex)\r\n\r\n    STAGE = \"获取当前DWG\"\r\n\r\n    doc = Application.DocumentManager.MdiActiveDocument\r\n\r\n    if doc is None:\r\n        raise RuntimeError(\"没有活动DWG文档\")\r\n\r\n    db = doc.Database\r\n    drawing_name = str(doc.Name)\r\n    drawing_units = str(db.Insunits)\r\n\r\n    records = []\r\n    vertices = []\r\n    properties = []\r\n    pset_columns = set()\r\n\r\n    scanned = 0\r\n    skipped_xref_definitions = 0\r\n    seen_handles = set()\r\n\r\n    STAGE = \"读取DWG对象\"\r\n\r\n    document_lock = doc.LockDocument()\r\n    transaction = None\r\n\r\n    try:\r\n        transaction = db.TransactionManager.StartTransaction()\r\n\r\n        block_table = transaction.GetObject(\r\n            db.BlockTableId,\r\n            OpenMode.ForRead\r\n        )\r\n\r\n        for block_id in block_table:\r\n            try:\r\n                block = transaction.GetObject(\r\n                    block_id,\r\n                    OpenMode.ForRead\r\n                )\r\n\r\n                # 不进入外部参照文件或外参块定义。\r\n                if (\r\n                    block.IsFromExternalReference\r\n                    or block.IsFromOverlayReference\r\n                ):\r\n                    skipped_xref_definitions += 1\r\n                    continue\r\n\r\n                if block.IsLayout:\r\n                    layout = transaction.GetObject(\r\n                        block.LayoutId,\r\n                        OpenMode.ForRead\r\n                    )\r\n\r\n                    if not layout.ModelType and not include_layouts:\r\n                        continue\r\n\r\n                    scope = (\r\n                        \"Model\"\r\n                        if layout.ModelType\r\n                        else \"Layout\"\r\n                    )\r\n                    owner = str(layout.LayoutName)\r\n\r\n                else:\r\n                    if not include_blocks:\r\n                        continue\r\n\r\n                    scope = \"BlockDefinition\"\r\n                    owner = str(block.Name)\r\n\r\n            except Exception as ex:\r\n                log(str(block_id.Handle), \"读取块/布局\", ex)\r\n                continue\r\n\r\n            for object_id in block:\r\n                handle = str(object_id.Handle)\r\n\r\n                if handle in seen_handles:\r\n                    continue\r\n\r\n                try:\r\n                    obj = transaction.GetObject(\r\n                        object_id,\r\n                        OpenMode.ForRead\r\n                    )\r\n\r\n                    if not isinstance(obj, Entity):\r\n                        continue\r\n\r\n                    seen_handles.add(handle)\r\n                    scanned += 1\r\n\r\n                    row = {\r\n                        \"Handle\": handle,\r\n                        \"Scope\": scope,\r\n                        \"Owner\": owner,\r\n                        \"Category\": str(obj.GetType().Name),\r\n                        \"API Type\": str(obj.GetType().FullName),\r\n                        \"Layer\": plain(read(obj, \"Layer\", handle))\r\n                    }\r\n\r\n                    row[\"Name\"] = plain(\r\n                        first(\r\n                            obj,\r\n                            [\"Name\", \"PointName\"],\r\n                            handle\r\n                        )\r\n                    )\r\n\r\n                    if isinstance(obj, BlockReference):\r\n                        row[\"Name\"] = plain(\r\n                            object_name(\r\n                                transaction,\r\n                                obj.BlockTableRecord,\r\n                                handle\r\n                            )\r\n                        )\r\n\r\n                    row[\"Style\"] = plain(\r\n                        object_name(\r\n                            transaction,\r\n                            read(obj, \"StyleId\", handle),\r\n                            handle\r\n                        )\r\n                    )\r\n\r\n                    row[\"Material\"] = plain(\r\n                        object_name(\r\n                            transaction,\r\n                            read(obj, \"MaterialId\", handle),\r\n                            handle\r\n                        )\r\n                    )\r\n\r\n                    row[\"Description\"] = plain(\r\n                        first(\r\n                            obj,\r\n                            [\r\n                                \"FullDescription\",\r\n                                \"Description\",\r\n                                \"RawDescription\"\r\n                            ],\r\n                            handle\r\n                        )\r\n                    )\r\n\r\n                    row[\"Easting\"] = plain(\r\n                        read(obj, \"Easting\", handle)\r\n                    )\r\n\r\n                    row[\"Northing\"] = plain(\r\n                        read(obj, \"Northing\", handle)\r\n                    )\r\n\r\n                    row[\"Elevation\"] = plain(\r\n                        read(obj, \"Elevation\", handle)\r\n                    )\r\n\r\n                    row[\"Point Elevation\"] = None\r\n\r\n                    if isinstance(obj, CogoPoint):\r\n                        row[\"Point Elevation\"] = row[\"Elevation\"]\r\n\r\n                    elif isinstance(obj, DBPoint):\r\n                        row[\"Point Elevation\"] = plain(obj.Position.Z)\r\n\r\n                    row[\"Area\"] = plain(\r\n                        read(obj, \"Area\", handle)\r\n                    )\r\n\r\n                    row[\"Length\"] = plain(\r\n                        read(obj, \"Length\", handle)\r\n                    )\r\n\r\n                    # 对未公开Length属性的Curve，尝试读取累计长度。\r\n                    if (\r\n                        row[\"Length\"] is None\r\n                        and isinstance(obj, Curve)\r\n                    ):\r\n                        try:\r\n                            row[\"Length\"] = plain(\r\n                                obj.GetDistanceAtParameter(obj.EndParam)\r\n                                - obj.GetDistanceAtParameter(obj.StartParam)\r\n                            )\r\n                        except Exception as ex:\r\n                            log(handle, \"CurveLength\", ex)\r\n\r\n                    row[\"IsReferenceObject\"] = plain(\r\n                        read(obj, \"IsReferenceObject\", handle)\r\n                    )\r\n\r\n                    # 顶点默认值。\r\n                    row[\"Vertex X\"] = None\r\n                    row[\"Vertex Y\"] = None\r\n                    row[\"Vertex Z\"] = None\r\n                    row[\"Vertex Count\"] = None\r\n                    row[\"Geometry Status\"] = \"Not processed\"\r\n\r\n                    try:\r\n                        points, geometry_status = vertex_points(\r\n                            obj,\r\n                            transaction\r\n                        )\r\n\r\n                        row[\"Geometry Status\"] = geometry_status\r\n                        row[\"Vertex Count\"] = len(points)\r\n\r\n                        if points:\r\n                            row[\"Vertex X\"] = plain(points[0].X)\r\n                            row[\"Vertex Y\"] = plain(points[0].Y)\r\n                            row[\"Vertex Z\"] = plain(points[0].Z)\r\n\r\n                        for index, point in enumerate(points, 1):\r\n                            vertices.append([\r\n                                handle,\r\n                                scope,\r\n                                owner,\r\n                                index,\r\n                                plain(point.X),\r\n                                plain(point.Y),\r\n                                plain(point.Z),\r\n                                geometry_status\r\n                            ])\r\n\r\n                    except Exception as ex:\r\n                        row[\"Geometry Status\"] = \"ERROR\"\r\n                        log(handle, \"Vertices\", ex)\r\n\r\n                    # 读取已经附加到对象上的Property Sets。\r\n                    row[\"Property Sets Status\"] = \"OK\"\r\n                    row[\"Property Set Count\"] = None\r\n\r\n                    try:\r\n                        property_set_ids = list(\r\n                            PropertyDataServices.GetPropertySets(obj)\r\n                        )\r\n                        row[\"Property Set Count\"] = len(property_set_ids)\r\n\r\n                    except Exception as ex:\r\n                        property_set_ids = []\r\n\r\n                        # 部分对象无属性集时可能返回eKeyNotFound。\r\n                        if \"eKeyNotFound\" in str(ex):\r\n                            row[\"Property Set Count\"] = 0\r\n                            row[\"Property Sets Status\"] = (\r\n                                \"No attached Property Sets\"\r\n                            )\r\n                        else:\r\n                            row[\"Property Sets Status\"] = \"ERROR\"\r\n                            log(handle, \"GetPropertySets\", ex)\r\n\r\n                    for property_set_id in property_set_ids:\r\n                        try:\r\n                            property_set = transaction.GetObject(\r\n                                property_set_id,\r\n                                OpenMode.ForRead\r\n                            )\r\n\r\n                            definition = transaction.GetObject(\r\n                                property_set.PropertySetDefinition,\r\n                                OpenMode.ForRead\r\n                            )\r\n\r\n                            set_name = str(definition.Name)\r\n                            set_handle = str(property_set_id.Handle)\r\n\r\n                            for parameter in definition.Definitions:\r\n                                parameter_name = str(parameter.Name)\r\n                                parameter_id = str(parameter.Id)\r\n\r\n                                column_key = \"PSET::{}::{}::{}\".format(\r\n                                    set_name,\r\n                                    parameter_name,\r\n                                    parameter_id\r\n                                )\r\n\r\n                                pset_columns.add(column_key)\r\n\r\n                                value = None\r\n                                status = \"OK\"\r\n\r\n                                try:\r\n                                    value = plain(\r\n                                        property_set.GetAt(parameter.Id)\r\n                                    )\r\n                                except Exception as ex:\r\n                                    status = \"ERROR: \" + str(ex)\r\n                                    row[\"Property Sets Status\"] = (\r\n                                        \"Partial errors\"\r\n                                    )\r\n                                    log(handle, column_key, ex)\r\n\r\n                                row[column_key] = value\r\n\r\n                                properties.append([\r\n                                    handle,\r\n                                    scope,\r\n                                    owner,\r\n                                    set_handle,\r\n                                    set_name,\r\n                                    parameter_name,\r\n                                    parameter_id,\r\n                                    plain(\r\n                                        read(\r\n                                            parameter,\r\n                                            \"DataType\",\r\n                                            handle\r\n                                        )\r\n                                    ),\r\n                                    value,\r\n                                    status\r\n                                ])\r\n\r\n                        except Exception as ex:\r\n                            row[\"Property Sets Status\"] = \"Partial errors\"\r\n                            log(handle, \"PropertySet\", ex)\r\n\r\n                    # 不让.NET对象逃逸到事务之外。\r\n                    records.append({\r\n                        key: plain(value)\r\n                        for key, value in row.items()\r\n                    })\r\n\r\n                except Exception as ex:\r\n                    log(handle, \"Entity\", ex)\r\n\r\n        # 只读事务，不调用Commit，不修改DWG。\r\n\r\n    finally:\r\n        try:\r\n            if transaction is not None:\r\n                transaction.Dispose()\r\n        finally:\r\n            document_lock.Dispose()\r\n\r\n    STAGE = \"组织Excel数据\"\r\n\r\n    base_headers = [\r\n        \"Handle\",\r\n        \"Scope\",\r\n        \"Owner\",\r\n        \"Category\",\r\n        \"API Type\",\r\n        \"Name\",\r\n        \"Layer\",\r\n        \"Style\",\r\n        \"Material\",\r\n        \"Description\",\r\n        \"Easting\",\r\n        \"Northing\",\r\n        \"Point Elevation\",\r\n        \"Vertex X\",\r\n        \"Vertex Y\",\r\n        \"Vertex Z\",\r\n        \"Elevation\",\r\n        \"Area\",\r\n        \"Length\",\r\n        \"Vertex Count\",\r\n        \"Geometry Status\",\r\n        \"IsReferenceObject\",\r\n        \"Property Set Count\",\r\n        \"Property Sets Status\"\r\n    ]\r\n\r\n    headers = base_headers + sorted(pset_columns)\r\n\r\n    element_rows = [headers]\r\n\r\n    for record in records:\r\n        element_rows.append([\r\n            record.get(header)\r\n            for header in headers\r\n        ])\r\n\r\n    metadata_rows = [\r\n        [\"Item\", \"Value\"],\r\n        [\"DWG\", drawing_name],\r\n        [\r\n            \"Exported\",\r\n            datetime.now().isoformat(timespec=\"seconds\")\r\n        ],\r\n        [\"Drawing insertion units\", drawing_units],\r\n        [\"Include layouts\", include_layouts],\r\n        [\"Include local block definitions\", include_blocks],\r\n        [\r\n            \"Coordinates\",\r\n            \"WCS; block definitions use definition coordinates\"\r\n        ],\r\n        [\"Scanned entities\", scanned],\r\n        [\"Exported entities\", len(records)],\r\n        [\"Vertex rows\", len(vertices)],\r\n        [\"Property parameter rows\", len(properties)],\r\n        [\"Property parameter columns\", len(pset_columns)],\r\n        [\"Log rows\", len(LOG)],\r\n        [\r\n            \"Skipped external-reference definitions\",\r\n            skipped_xref_definitions\r\n        ],\r\n        [\r\n            \"FeatureLine enum initialized\",\r\n            FeatureLinePointType is not None\r\n        ],\r\n        [\r\n            \"Category mapping\",\r\n            \".NET class name; not localized Properties palette category\"\r\n        ],\r\n        [\r\n            \"Material mapping\",\r\n            \"Assigned MaterialId; no ByLayer/ByBlock resolution\"\r\n        ],\r\n        [\r\n            \"Vertex X/Y/Z in Elements\",\r\n            \"First vertex only; all supported vertices in Vertices\"\r\n        ],\r\n        [\r\n            \"Units\",\r\n            \"Raw API values; no unit or coordinate-system conversion\"\r\n        ],\r\n        [\r\n            \"Property Sets\",\r\n            \"Existing attached sets only; no creation or forced update\"\r\n        ],\r\n        [\r\n            \"Scope limitation\",\r\n            \"Entities in selected spaces and optional local block definitions; \"\r\n            \"no external DWG traversal or Civil internal geometry expansion\"\r\n        ]\r\n    ]\r\n\r\n    sheets = [\r\n        (\r\n            \"Elements\",\r\n            element_rows\r\n        ),\r\n        (\r\n            \"Vertices\",\r\n            [[\r\n                \"Handle\",\r\n                \"Scope\",\r\n                \"Owner\",\r\n                \"Vertex Index\",\r\n                \"Vertex X\",\r\n                \"Vertex Y\",\r\n                \"Vertex Z\",\r\n                \"Source\"\r\n            ]] + vertices\r\n        ),\r\n        (\r\n            \"PropertySets\",\r\n            [[\r\n                \"Handle\",\r\n                \"Scope\",\r\n                \"Owner\",\r\n                \"PropertySet Handle\",\r\n                \"PropertySet\",\r\n                \"Parameter\",\r\n                \"Parameter ID\",\r\n                \"Data Type\",\r\n                \"Value\",\r\n                \"Status\"\r\n            ]] + properties\r\n        ),\r\n        (\r\n            \"Log\",\r\n            [[\r\n                \"Handle\",\r\n                \"Stage\",\r\n                \"Message\"\r\n            ]] + LOG\r\n        ),\r\n        (\r\n            \"Metadata\",\r\n            metadata_rows\r\n        )\r\n    ]\r\n\r\n    STAGE = \"写入XLSX\"\r\n    write_xlsx(path, sheets)\r\n\r\n    STAGE = \"完成\"\r\n\r\n    return {\r\n        \"Status\": (\r\n            \"已导出\"\r\n            if not LOG\r\n            else \"已导出，请检查Log\"\r\n        ),\r\n        \"File\": path,\r\n        \"ScannedEntities\": scanned,\r\n        \"ExportedEntities\": len(records),\r\n        \"VertexRows\": len(vertices),\r\n        \"PropertyParameterRows\": len(properties),\r\n        \"PropertyParameterColumns\": len(pset_columns),\r\n        \"FeatureLineEnumReady\": FeatureLinePointType is not None,\r\n        \"LogRows\": len(LOG),\r\n        \"LogPreview\": LOG[:20]\r\n    }\r\n\r\n\r\n# ============================================================\r\n# Dynamo输出\r\n# ============================================================\r\n\r\ntry:\r\n    OUT = export()\r\n\r\nexcept Exception:\r\n    OUT = {\r\n        \"Status\": \"失败\",\r\n        \"Stage\": STAGE,\r\n        \"Error\": traceback.format_exc(),\r\n        \"LogRows\": len(LOG),\r\n        \"LogPreview\": LOG[:20]\r\n    }",
+      "Engine": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "67572297511840bfb45e128b595b652f",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "274bf4cd81b44b0891cb0fc37cefa0f5",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "1c535dffe2da44649de038fdb5e46d57",
+          "Name": "IN[1]",
+          "Description": "Input #1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "c53838f934e34062b6244902d40559f9",
+          "Name": "IN[2]",
+          "Description": "Input #2",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "13643f2737f54e36a53c1192461160fd",
+          "Name": "IN[3]",
+          "Description": "Input #3",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "a42168a4aa624c6ebf844a5613599081",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "Id": "89ff6fee4f304f8d826b2bd61787ce20",
+      "NodeType": "BooleanInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "e5c9aa0dd0ba462391e4033c6ec03edc",
+          "Name": "",
+          "Description": "Boolean",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Enables selection between True and False",
+      "InputValue": false
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "WatchWidth": 495.3333333333333,
+      "WatchHeight": 452.0,
+      "Id": "a9f2d17627eb4f30b5f30890505bbc0d",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "c13e5321c8914c0286c957236d157444",
+          "Name": "",
+          "Description": "Node to show output from",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "3b1d25e88cbc43a086c1a1eb58d4896d",
+          "Name": "",
+          "Description": "Node output",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Visualizes a node's output"
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.StringInput, CoreNodeModels",
+      "Id": "05eb64cff9d24f95936907769f118c7b",
+      "NodeType": "StringInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "0a7fcf61f03f4a3b8816fe654523629b",
+          "Name": "",
+          "Description": "String",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Creates a string",
+      "InputValue": "D:\\Users\\LI_Y1\\Desktop\\DWG_Properties.xlsx"
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Input.BoolSelector, CoreNodeModels",
+      "Id": "c0a4a023b3ba4193acf98d54fa28e8ae",
+      "NodeType": "BooleanInputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "18d73dfa9cd34fb1a7970cc557add6ae",
+          "Name": "",
+          "Description": "Boolean",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Enables selection between True and False",
+      "InputValue": true
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "f2a9d0e6d83a4546aa260d2bf371e6d4",
+      "End": "c53838f934e34062b6244902d40559f9",
+      "Id": "4ccb65d68e344770b02426c4605b341a",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "a42168a4aa624c6ebf844a5613599081",
+      "End": "c13e5321c8914c0286c957236d157444",
+      "Id": "cbdaba5e1d34461b8d61eb47e8fb4cfe",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "e5c9aa0dd0ba462391e4033c6ec03edc",
+      "End": "13643f2737f54e36a53c1192461160fd",
+      "Id": "03df26bb3a2742f98338792f920c8f05",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "0a7fcf61f03f4a3b8816fe654523629b",
+      "End": "274bf4cd81b44b0891cb0fc37cefa0f5",
+      "Id": "bff18ad4d5204fd496c65e8091c7921b",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "18d73dfa9cd34fb1a7970cc557add6ae",
+      "End": "1c535dffe2da44649de038fdb5e46d57",
+      "Id": "615c59257337482fadcc083757723529",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [
+    {
+      "Name": "DWG.xlsx",
+      "ReferenceType": "External",
+      "Nodes": [
+        "05eb64cff9d24f95936907769f118c7b"
+      ]
+    }
+  ],
+  "EnableLegacyPolyCurveBehavior": null,
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "3.4",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "3.4.1.7055",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "ad58cab4dbd1464fa2e5705077a98ce5",
+        "Name": "Include Layout",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -409.0489472971773,
+        "Y": 637.3425432538861
+      },
+      {
+        "Id": "67572297511840bfb45e128b595b652f",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -61.3682441103972,
+        "Y": 477.8699161945509
+      },
+      {
+        "Id": "89ff6fee4f304f8d826b2bd61787ce20",
+        "Name": "Include Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -405.5338288706246,
+        "Y": 763.3095163069479
+      },
+      {
+        "Id": "a9f2d17627eb4f30b5f30890505bbc0d",
+        "Name": "Watch",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 295.6271338318287,
+        "Y": -13.05015202941371
+      },
+      {
+        "Id": "05eb64cff9d24f95936907769f118c7b",
+        "Name": "Output xlsx w/ path",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -466.3158690752605,
+        "Y": 33.909886431227505
+      },
+      {
+        "Id": "c0a4a023b3ba4193acf98d54fa28e8ae",
+        "Name": "Run",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -402.5770335383969,
+        "Y": 515.884148306824
+      }
+    ],
+    "Annotations": [
+      {
+        "Id": "749e1dee904547f3a7f893ee2ee59158",
+        "Title": "Input the target xlsx with full path",
+        "DescriptionText": "Description <Double click here to edit group description>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "05eb64cff9d24f95936907769f118c7b"
+        ],
+        "HasNestedGroups": false,
+        "Left": -476.3158690752605,
+        "Top": -134.0901135687725,
+        "Width": 262.0,
+        "Height": 318.33333333333337,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": 33.909886431227505,
+        "InitialHeight": 180.33333333333334,
+        "TextblockHeight": 158.0,
+        "Background": "#FFC1D676"
+      }
+    ],
+    "X": 930.9073405084598,
+    "Y": 369.8540925219395,
+    "Zoom": 0.7138667798656083
+  }
+}
